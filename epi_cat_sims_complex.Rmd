@@ -1,0 +1,633 @@
+---
+title: "Complex kinetic model simulations"
+output:
+  html_document:
+    code_folding: "hide"
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 16px;
+  }
+td {  /* Table  */
+  font-size: 16px;
+}
+h1.title {
+  font-size: 28px;
+}
+h1 { /* Header 1 */
+  font-size: 24px;
+}
+h2 { /* Header 2 */
+    font-size: 22px;
+}
+h3 { /* Header 3 */
+  font-size: 20px;
+}
+code.r{ /* Code block */
+    font-size: 12px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 14px;
+}
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, error = FALSE, message = FALSE)
+
+if (!require('tidyverse')) install.packages('tidyverse'); library('tidyverse') # for everything
+if (!require('purrr')) install.packages('purrr'); library('purrr') # for progress bar
+if (!require('progress')) install.packages('progress'); library('progress') # for progress bar
+
+set.seed(321)
+```
+
+# Overview
+
+We first set up a free energy diagram for the the more complex reaction E + S = ES = EP -> E + P. Then I extract rate and equilibrium constants using the free energies, and make the assumption for rate constants that the Arrhenius constant is *k*~b~ * T / *h*.
+
+Next, we introduce 1000 random "mutations" which sample from -2 to 2 kcal mol^-1^ and modulate the energy of each ground and/or transition state by that amount. These are all save in a spreadsheet (see Supplementary data 1).
+
+Finally, we test all combinations of the 1000 mutations and calculate the predicted and observed rate constants.
+
+# Setup
+
+First we need to setup the free energy profile based on the simple reaction E + S = ES = EP -> E + P
+
+The free energies will be set up in the energies vector
+
+```{r}
+energies <- list(e = 0,
+                 e_s_dagger = 10,
+                 es = -5,
+                 es_dagger = 11,
+                 ep = -9,
+                 ep_dagger = 9
+)
+```
+
+Then we define the global constants
+
+```{r}
+kb = 3.297623483e-27 # kcal/K
+h = 1.58e-37 # kcal s
+temp = 273+25 # K in room temp
+r = 1.9872036e-3 # kcal K-1 mol-1
+A = (kb*temp)/h # Collision constant as defined broadly by transition state theory
+```
+
+We note that a more accurate approximation of the *A* constant would utilize collision theory, due to the nature of E + S representing a bimolecular collision of E + S. This means that the rate constant can theoretically approach `r A` which exceeds rate-limiting diffusion. Nevertheless, we retain this approximation for simplicity.
+
+Then we can define the equations for rate constants using the energy terms:
+
+```{r}
+define_constants <- function(energies) {
+  kon = A*exp(-1*(energies$e_s_dagger-energies$e) / (r*temp)) # M s-1
+  koff = A*exp(-1*(energies$e_s_dagger-energies$es) / (r*temp)) # s-1
+  kchem = A*exp(-1*(energies$es_dagger-energies$es) / (r*temp)) # s-1
+  kchemrev = A*exp(-1*(energies$es_dagger-energies$ep) / (r*temp)) # s-1
+  kprod = A*exp(-1*(energies$ep_dagger-energies$ep) / (r*temp)) # s-1
+  
+  kd = koff/kon
+  kcat = (kchem*kprod)/(kchem + kchemrev + kprod)
+  km = ((kchem*kprod) + (koff*kchemrev) + (koff*kprod))/(kon*(kchem + kchemrev + kprod))
+  catef = kcat/km
+  
+  return(list(kon = kon, 
+              koff = koff, 
+              kchem = kchem,
+              kchemrev = kchemrev,
+              kprod = kprod,
+              kd = kd, 
+              kcat = kcat, 
+              km = km,
+              catef = catef))
+}
+```
+
+And check the values for each constants
+
+```{r}
+cur_const <- define_constants(energies)
+cur_const
+```
+
+These seem like appropriate starting conditions for the experiment with *k*~on~ ~ 2.8e5 M s^-1^, *k*~off~ ~ 60 s^-1^, *k*~cat~ ~ 0.378 s^-1^, *K*~M~ ~ 8.6 µM, *K*~D~ ~ 215 µM, and a *k*~cat~ / *K*~M~ of 4.3e4 M^-1^ s^-1^. The *k*~cat~ is low, while *k*~cat~ / *K*~M~ lie within ranges of median enzymes.
+
+# Mutational simulations
+
+First we prepare a table to store the free energies and rate constants of the mutants:
+
+```{r}
+dt <- tibble(e = numeric(),
+             e_s_dagger = numeric(),
+             es = numeric(),
+             es_dagger = numeric(),
+             ep = numeric(),
+             ep_dagger = numeric(),
+             kon = numeric(),
+             koff = numeric(),
+             kchem = numeric(),
+             kchemrev = numeric(),
+             kprod = numeric(),
+             kd = numeric(),
+             kcat = numeric(),
+             km = numeric(),
+             catef = numeric())
+
+dt <- rbind(dt, c(unlist(energies), unlist(cur_const)))
+names(dt) = c("e",
+              "e_s_dagger",
+              "es",
+              "es_dagger",
+              "ep",
+              "ep_dagger",
+              "kon",
+              "koff",
+              "kchem",
+              "kchemrev",
+              "kprod",
+              "kd",
+              "kcat",
+              "km",
+              "catef")
+dt
+```
+
+Then we can setup a simulation where each mutant free energy is the sum of the wt free energy and a randomly chosen energy ranging from -2 to 2 kcal mol^-1^
+
+```{r}
+mutation <- function(dt){
+  # Assuming mutation can change all steps by a random amount
+  new_energies <- list(e = energies$e + runif(1, -2, 2),
+                   e_s_dagger = energies$e_s_dagger + runif(1, -2, 2),
+                   es = energies$es + runif(1, -2, 2),
+                   es_dagger = energies$es_dagger + runif(1, -2, 2),
+                   ep = energies$ep + runif(1, -2, 2),
+                   ep_dagger = energies$ep_dagger + runif(1, -2, 2))
+  mut_const <- define_constants(new_energies)
+  
+  return(rbind(dt, c(unlist(new_energies), unlist(mut_const))))
+}
+```
+
+And we simulate 1000 mutations and export the data into **Supplementary data 3**
+
+```{r}
+for(i in 1:1000){
+  dt <- mutation(dt)
+}
+
+head(dt)
+write_csv(dt, "Supplementary Data 3.csv")
+```
+
+# General statistics
+
+We interrogate the spread of *K*~D~, *k*~cat~, *K*~M~, and *k*~cat~ / *K*~M~ for the 1000 single mutants (see **Fig. 4b** in the main text)
+
+```{r}
+dt_all_spread <- dt %>%
+  mutate(kcat_norm = log10(kcat / kcat[1]),
+         kd_norm = log10(kd / kd[1]),
+         km_norm = log10(km / km[1]),
+         catef_norm = log10(catef / catef[1])) %>%
+  pivot_longer(c(kcat_norm, kd_norm, km_norm, catef_norm)) %>%
+  select(name, value)
+
+# Change density plot fill colors by groups
+dt_all_spread_plot <- dt_all_spread %>%
+  ggplot(aes(x = value, fill = name)) +
+  geom_density() +
+  scale_fill_manual(values = c("#745fe8","#ca3a7d","#ea692f","#f3b33e")) +
+  geom_vline(xintercept = log10(1), col = "black", lty = 2) +
+  xlim(c(-5, 5)) +
+  labs(x = "log10 parameter value", y = "Density") +
+  theme_classic()
+  #theme(axis.line = element_line(size = 0.2, color = "black"), axis.ticks = element_line(size = 0.2, color = "black"), text = element_text(size = 9), axis.text = element_text(size = 8, color = "black"), legend.position = "none")
+
+dt_all_spread_plot
+
+#ggsave("density_plot_complex.svg", plot = dt_all_spread_plot, width = 180/2, height = 247/4, dpi = 300, units = "mm")
+
+```
+
+# Simulation of mutational combinations
+
+Next, we create 10^6^ double mutants by combining mutational effects from each single mutant found in **Supplementary data 3**. We compute the predicted kinetic parameters and observed parameters as follows:
+
+For predicted kinetic parameters, we take the product of the wt kinetic parameter, the fold-change of mutation 1, and the fold-change of mutation 2. For the observed kinetic parameter, we first compute each microscopic rate constant of the double mutant by calculating the sum of free energy changes to each state in the reaction coordinate based on the single mutation effects. Then, we use the newly computed rate constants to obtained the *true* kinetic parameter of the double mutant.
+
+We quantify epistasis as the ratio of the predicted vs observed kinetic parameter, and consider it significant if it exceeds 1.5-fold.
+
+For each kinetic parameter, we also collect information on the fold change of the single mutation effect to determine whether the double mutant exhibits sign or magnitude epistasis.
+
+```{r}
+library(purrr)
+library(progress)
+
+# Check for file, you can just upload if this is the case
+if(file.exists('Supplementary Data 4.csv')){
+  epi_dt <- read_csv("Supplementary Data 4.csv")
+} else {
+  # Generate all pairwise combinations of mutations
+mut_combinations <- combn(2:(nrow(dt) - 1), 2, simplify = FALSE)
+
+# Initialize a progress bar - ONLY WORKS IN CONSOLE, NOT IN RMD
+pb <- progress_bar$new(
+  format = "  Processing [:bar] :percent in :elapsed, ETA: :eta",
+  total = length(mut_combinations),
+  clear = FALSE,
+  width = 60
+)
+
+# Process combinations with progress bar (console only)
+epi_dt <- map_dfr(mut_combinations, function(pair) {
+  pb$tick()  # Update progress bar at each iteration
+  i <- pair[1]
+  j <- pair[2]
+  
+  wt_catef <- dt$catef[1]
+  mut1_fold_catef <- dt$catef[i] / wt_catef
+  mut2_fold_catef <- dt$catef[j] / wt_catef
+  
+  pred_catef <- wt_catef * mut1_fold_catef * mut2_fold_catef
+  
+  wt_km <- dt$km[1]
+  mut1_fold_km <- dt$km[i] / wt_km
+  mut2_fold_km <- dt$km[j] / wt_km
+  
+  pred_km <- wt_km * mut1_fold_km * mut2_fold_km
+  
+  wt_kd <- dt$kd[1]
+  mut1_fold_kd <- dt$kd[i] / wt_kd
+  mut2_fold_kd <- dt$kd[j] / wt_kd
+  
+  pred_kd <- wt_kd * mut1_fold_kd * mut2_fold_kd
+  
+  wt_kcat <- dt$kcat[1]
+  mut1_fold_kcat <- dt$kcat[i] / wt_kcat
+  mut2_fold_kcat <- dt$kcat[j] / wt_kcat
+  
+  pred_kcat <- wt_kcat * mut1_fold_kcat * mut2_fold_kcat
+  
+  mut_e <- dt$e[1] + (dt$e[i] - dt$e[1] + dt$e[j] - dt$e[1])
+  mut_e_s_dagger <- dt$e_s_dagger[1] + (dt$e_s_dagger[i] - dt$e_s_dagger[1] + dt$e_s_dagger[j] - dt$e_s_dagger[1])
+  mut_es <- dt$es[1] + (dt$es[i] - dt$es[1] + dt$es[j] - dt$es[1])
+  mut_es_dagger <- dt$es_dagger[1] + (dt$es_dagger[i] - dt$es_dagger[1] + dt$es_dagger[j] - dt$es_dagger[1])
+  mut_ep <- dt$ep[1] + (dt$ep[i] - dt$ep[1] + dt$ep[j] - dt$ep[1])
+  mut_ep_dagger <- dt$ep_dagger[1] + (dt$ep_dagger[i] - dt$ep_dagger[1] + dt$ep_dagger[j] - dt$ep_dagger[1])
+  
+  mut_energies <- list(e = mut_e, e_s_dagger = mut_e_s_dagger, es = mut_es, es_dagger = mut_es_dagger, ep = mut_ep, ep_dagger = mut_ep_dagger)
+  cur_mut_const <- define_constants(mut_energies)
+  
+  tibble(
+    e = mut_energies$e,
+    e_s_dagger = mut_energies$e_s_dagger,
+    es = mut_energies$es,
+    es_dagger = mut_energies$es_dagger,
+    ep = mut_energies$ep,
+    ep_dagger = mut_energies$ep_dagger,
+    kon = cur_mut_const$kon,
+    koff = cur_mut_const$koff,
+    kchem = cur_mut_const$kchem,
+    kchemrev = cur_mut_const$kchemrev,
+    kprod = cur_mut_const$kprod,
+    kd = cur_mut_const$kd,
+    kcat = cur_mut_const$kcat,
+    km = cur_mut_const$km,
+    catef = cur_mut_const$catef,
+    pred_catef = pred_catef,
+    pred_km = pred_km,
+    pred_kd = pred_kd,
+    pred_kcat = pred_kcat,
+    mut1_fold = mut1_fold_catef,
+    mut2_fold = mut2_fold_catef,
+    mut1_fold_kcat = mut1_fold_kcat,
+    mut2_fold_kcat = mut2_fold_kcat,
+    mut1_fold_km = mut1_fold_km,
+    mut2_fold_km = mut2_fold_km,
+    mut1_fold_kd = mut1_fold_kd,
+    mut2_fold_kd = mut2_fold_kd,
+    mut1 = i,
+    mut2 = j
+  )
+})
+
+head(epi_dt)
+
+write_csv(epi_dt, "Supplementary Data 4.csv")
+}
+
+
+```
+
+# Investigation of mutational combinations
+
+## Significant epistasis in *k*~cat~ / *K*~M~ 
+
+First I establish a function to calculate significant epistasis and classify it as magnitude, sign, and reciprocal sign
+
+```{r}
+sig_epi_classification <- function(sig_thresh, epi_dt) {
+  this_df <- epi_dt %>%
+  mutate(sign_change = log10(catef/dt$catef[1]),
+         sign_mut1 = log10(mut1_fold),
+         sign_mut2 = log10(mut2_fold),
+         epi = log10(catef/pred_catef)) %>%
+  mutate(sign = case_when( ((epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) & sign_mut1 > 0 & sign_mut2 > 0 & sign_change < 0) ~ "reciprocal",
+                           ((epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) & sign_mut1 < 0 & sign_mut2 < 0 & sign_change > 0) ~ "reciprocal",
+                           ((epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) & sign_mut1 > 0 & sign_mut2 < 0 & (sign_change > sign_mut1 | sign_change < sign_mut2) ) ~ "sign",
+                           ((epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) & sign_mut1 < 0 & sign_mut2 > 0 & (sign_change < sign_mut1 | sign_change > sign_mut2) ) ~ "sign",
+                           (epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) ~ "magnitude",
+                           TRUE ~ "no epistasis"))
+  
+  return(this_df)
+}
+```
+
+Then, we check much significant epistasis is there in *k*~cat~ / *K*~M~ with a 1.5-fold threshold?
+
+```{r}
+epi_dt_2_sig <- sig_epi_classification(1.5, epi_dt)
+epi_dt_2_sig %>% count(sign) %>% mutate(n / sum(n) * 100)
+```
+
+What about a 2-fold threshold?
+
+```{r}
+epi_dt_2_sig <- sig_epi_classification(2, epi_dt)
+epi_dt_2_sig %>% count(sign) %>% mutate(n / sum(n) * 100)
+```
+
+A 5-fold threshold?
+
+```{r}
+epi_dt_2_sig <- sig_epi_classification(5, epi_dt)
+epi_dt_2_sig %>% count(sign) %>% mutate(n / sum(n) * 100)
+```
+
+A 10-fold threshold?
+
+```{r}
+epi_dt_2_sig <- sig_epi_classification(10, epi_dt)
+epi_dt_2_sig %>% count(sign) %>% mutate(n / sum(n) * 100)
+```
+
+Note that sign epistasis does not disappear even at high significance thresholds
+
+## Significant epistasis in *k*~cat~
+
+Again, I setup a function to calculate significant epistasis and classify it as magnitude, sign, and reciprocal sign, this time for *k*~cat~
+
+```{r}
+sig_epi_classification_kcat <- function(sig_thresh, epi_dt) {
+  this_df <- epi_dt %>%
+  mutate(sign_change = log10(kcat/dt$kcat[1]),
+         sign_mut1 = log10(mut1_fold_kcat),
+         sign_mut2 = log10(mut2_fold_kcat),
+         epi = log10(kcat/pred_kcat)) %>%
+  mutate(sign = case_when( ((epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) & sign_mut1 > 0 & sign_mut2 > 0 & sign_change < 0) ~ "reciprocal",
+                           ((epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) & sign_mut1 < 0 & sign_mut2 < 0 & sign_change > 0) ~ "reciprocal",
+                           ((epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) & sign_mut1 > 0 & sign_mut2 < 0 & (sign_change > sign_mut1 | sign_change < sign_mut2) ) ~ "sign",
+                           ((epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) & sign_mut1 < 0 & sign_mut2 > 0 & (sign_change < sign_mut1 | sign_change > sign_mut2) ) ~ "sign",
+                           (epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) ~ "magnitude",
+                           TRUE ~ "no epistasis"))
+  
+  return(this_df)
+}
+```
+
+Then, we check much significant epistasis is there in *k*~cat~ / *K*~M~ with a 1.5-fold threshold?
+
+```{r}
+epi_dt_2_sig <- sig_epi_classification_kcat(1.5, epi_dt)
+epi_dt_2_sig %>% count(sign) %>% mutate(n / sum(n) * 100)
+```
+
+What about a 2-fold threshold?
+
+```{r}
+epi_dt_2_sig <- sig_epi_classification_kcat(2, epi_dt)
+epi_dt_2_sig %>% count(sign) %>% mutate(n / sum(n) * 100)
+```
+
+A 5-fold threshold?
+
+```{r}
+epi_dt_2_sig <- sig_epi_classification_kcat(5, epi_dt)
+epi_dt_2_sig %>% count(sign) %>% mutate(n / sum(n) * 100)
+```
+
+A 10-fold threshold?
+
+```{r}
+epi_dt_2_sig <- sig_epi_classification_kcat(10, epi_dt)
+epi_dt_2_sig %>% count(sign) %>% mutate(n / sum(n) * 100)
+```
+
+Note that sign epistasis does not disappear even at high significance thresholds
+
+## Significant epistasis in *K*~M~
+
+A setup of the function to calculate and classify epistasis for *K*~M~
+
+```{r}
+sig_epi_classification_km <- function(sig_thresh, epi_dt) {
+  this_df <- epi_dt %>%
+  mutate(sign_change = log10(km/dt$km[1]),
+         sign_mut1 = log10(mut1_fold_km),
+         sign_mut2 = log10(mut2_fold_km),
+         epi = log10(km/pred_km)) %>%
+  mutate(sign = case_when( ((epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) & sign_mut1 > 0 & sign_mut2 > 0 & sign_change < 0) ~ "reciprocal",
+                           ((epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) & sign_mut1 < 0 & sign_mut2 < 0 & sign_change > 0) ~ "reciprocal",
+                           ((epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) & sign_mut1 > 0 & sign_mut2 < 0 & (sign_change > sign_mut1 | sign_change < sign_mut2) ) ~ "sign",
+                           ((epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) & sign_mut1 < 0 & sign_mut2 > 0 & (sign_change < sign_mut1 | sign_change > sign_mut2) ) ~ "sign",
+                           (epi > log10(sig_thresh) | epi < log10(1/sig_thresh)) ~ "magnitude",
+                           TRUE ~ "no epistasis"))
+  
+  return(this_df)
+}
+```
+
+```{r}
+epi_dt_2_sig <- sig_epi_classification_km(1.5, epi_dt)
+epi_dt_2_sig %>% count(sign) %>% mutate(n / sum(n) * 100)
+```
+
+What about a 2-fold threshold?
+
+```{r}
+epi_dt_2_sig <- sig_epi_classification_km(2, epi_dt)
+epi_dt_2_sig %>% count(sign) %>% mutate(n / sum(n) * 100)
+```
+
+A 5-fold threshold?
+
+```{r}
+epi_dt_2_sig <- sig_epi_classification_km(5, epi_dt)
+epi_dt_2_sig %>% count(sign) %>% mutate(n / sum(n) * 100)
+```
+
+A 10-fold threshold?
+
+```{r}
+epi_dt_2_sig <- sig_epi_classification_km(10, epi_dt)
+epi_dt_2_sig %>% count(sign) %>% mutate(n / sum(n) * 100)
+```
+
+Note that sign epistasis does not disappear even at high significance thresholds
+
+## Significant epistasis in *K*~D~
+
+```{r}
+epi_dt %>%
+  mutate(sign_change = log10(kd/dt$kd[1]),
+         epi = log10(kd/pred_kd)) %>%
+  mutate(sign = case_when( (epi > log10(1.5) | epi < log10(1/1.5)) ~ "epistasis",
+                           TRUE ~ "no epistasis")
+         
+  ) %>%
+  count(sign) %>% mutate(n / sum(n) * 100)
+```
+
+## Correlation plots of predicted vs observed effects
+
+What is the plot of *k*~cat~ / *K*~M~ of predicted vs observed employing a 1.5-fold threshold?
+
+```{r}
+epi_dt_2_sig <- sig_epi_classification(1.5, epi_dt)
+
+epi_dt_2_sig_catef_plot <- epi_dt_2_sig %>%
+  mutate(sign = factor(sign, levels = c("no epistasis", "magnitude", "sign", "reciprocal"))) %>%
+  ggplot(aes(x = log10(pred_catef), y = log10(catef), color = sign)) +
+  geom_point(alpha = 0.4, size = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linewidth = 0.3) +
+  geom_hline(yintercept = log10(dt[1,]$catef), lty = 2, linewidth = 0.3) +
+  geom_vline(xintercept = log10(dt[1,]$catef), lty = 2, linewidth = 0.3) +
+  scale_color_manual(values = c("grey","#E69F00","#1f78b4","#d73027")) +
+  labs(x = "Log10(Predicted kcat/Km)", "Log10(Observed kcat/Km)") +
+  theme_classic() +
+  theme(axis.line = element_line(size = 0.3, color = "black"), axis.ticks = element_line(size = 0.2, color = "black"), text = element_text(size = 9), axis.text = element_text(size = 8, color = "black"))
+
+epi_dt_2_sig_catef_plot
+
+#ggsave("catef_muts_comp.tiff", plot = epi_dt_2_sig_catef_plot, width = 180/2, height = 247/4, dpi = 600, units = "mm")
+```
+
+What is the plot of *K*~M~ predicted vs observed?
+
+```{r}
+epi_dt_2_sig_km <- sig_epi_classification_km(1.5, epi_dt)
+
+epi_dt_2_sig_km_plot <- epi_dt_2_sig_km %>%
+  mutate(sign = factor(sign, levels = c("no epistasis", "magnitude", "sign", "reciprocal"))) %>%
+  ggplot(aes(x = log10(pred_km), y = log10(km), color = sign)) +
+  geom_point(alpha = 0.4, size = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linewidth = 0.3) +
+  geom_hline(yintercept = log10(dt[1,]$km), lty = 2, linewidth = 0.3) +
+  geom_vline(xintercept = log10(dt[1,]$km), lty = 2, linewidth = 0.3) +
+  scale_color_manual(values = c("grey","#E69F00","#1f78b4","#d73027")) +
+  labs(x = "Log10(Predicted Km)", "Log10(Observed Km)") +
+  theme_classic() +
+  theme(axis.line = element_line(size = 0.3, color = "black"), axis.ticks = element_line(size = 0.2, color = "black"), text = element_text(size = 9), axis.text = element_text(size = 8, color = "black"))
+
+epi_dt_2_sig_km_plot
+```
+
+What is the plot of *k*~cat~ predicted vs observed?
+
+```{r}
+epi_dt_2_sig_kcat <- sig_epi_classification_kcat(1.5, epi_dt)
+
+epi_dt_2_sig_kcat_plot <- epi_dt_2_sig_kcat %>%
+  mutate(sign = factor(sign, levels = c("no epistasis", "magnitude", "sign", "reciprocal"))) %>%
+  ggplot(aes(x = log10(pred_kcat), y = log10(kcat), color = sign)) +
+  geom_point(alpha = 0.4, size = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linewidth = 0.3) +
+  geom_hline(yintercept = log10(dt[1,]$kcat), lty = 2, linewidth = 0.3) +
+  geom_vline(xintercept = log10(dt[1,]$kcat), lty = 2, linewidth = 0.3) +
+  scale_color_manual(values = c("grey","#E69F00","#1f78b4","#d73027")) +
+  labs(x = "Log10(Predicted kcat)", "Log10(Observed kcat)") +
+  theme_classic() +
+  theme(axis.line = element_line(size = 0.3, color = "black"), axis.ticks = element_line(size = 0.2, color = "black"), text = element_text(size = 9), axis.text = element_text(size = 8, color = "black"))
+
+epi_dt_2_sig_kcat_plot
+
+#ggsave("kcat_muts_comp_model.tiff", plot = epi_dt_2_sig_kcat_plot, width = 180/2, height = 247/4, dpi = 600, units = "mm")
+```
+
+What is the plot of *K*~D~ predicted vs observed?
+
+```{r}
+epi_dt_2_sig_kd <- epi_dt %>%
+  mutate(sign_change = log10(kd/dt$kd[1]),
+         epi = log10(kd/pred_kd)) %>%
+  mutate(sign = case_when( (epi > log10(1.5) | epi < log10(1/1.5)) ~ "epistasis",
+                           TRUE ~ "no epistasis"))
+
+# View(dt %>% mutate(across(everything(), ~ . - first(.))))
+
+epi_dt_2_sig_kd_plot <- epi_dt_2_sig_kd %>%
+  ggplot(aes(x = log10(pred_kd), y = log10(kd), color = sign)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, linewidth = 0.3) +
+  geom_hline(yintercept = log10(dt[1,]$kd), lty = 2, linewidth = 0.3) +
+  geom_vline(xintercept = log10(dt[1,]$kd), lty = 2, linewidth = 0.3) +
+  scale_color_manual(values = c("grey")) +
+  labs(x = "Log10(Predicted Kd)", "Log10(Observed Kd)") +
+  theme_classic() +
+  theme(axis.line = element_line(size = 0.3, color = "black"), axis.ticks = element_line(size = 0.2, color = "black"), text = element_text(size = 9), axis.text = element_text(size = 8, color = "black"))
+
+epi_dt_2_sig_kd_plot
+
+```
+
+## Positive-negative spread
+
+What is the spread of positive and negative mutations for *k*~cat~ / *K*~M~
+
+```{r}
+epi_dt %>%
+  mutate(epi = log10(catef/pred_catef)) %>%
+  filter(epi >= log10(1.5) | epi <= log10(1/1.5)) %>%
+  mutate(posneg = case_when(epi > 0 ~ "positive",
+                           epi < 0  ~ "negative",
+                           TRUE ~ "neutral")) %>%
+  count(posneg) %>%
+  mutate(freq = n / sum(n) * 100)
+```
+
+Then *K*~M~
+
+```{r}
+epi_dt %>%
+  mutate(epi = log10(km/pred_km)) %>%
+  filter(epi >= log10(1.5) | epi <= log10(1/1.5)) %>%
+  mutate(posneg = case_when(epi > 0 ~ "positive",
+                           epi < 0  ~ "negative",
+                           TRUE ~ "neutral")) %>%
+  count(posneg) %>%
+  mutate(freq = n / sum(n) * 100)
+```
+
+Then *k*~cat~
+
+```{r}
+epi_dt %>%
+  mutate(epi = log10(kcat/pred_kcat)) %>%
+  filter(epi >= log10(1.5) | epi <= log10(1/1.5)) %>%
+  mutate(posneg = case_when(epi > 0 ~ "positive",
+                           epi < 0  ~ "negative",
+                           TRUE ~ "neutral")) %>%
+  count(posneg) %>%
+  mutate(freq = n / sum(n) * 100)
+```
