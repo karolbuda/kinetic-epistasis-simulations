@@ -44,7 +44,6 @@ pre { /* Code block - determines code spacing between lines */
 knitr::opts_chunk$set(echo = TRUE, error = FALSE, message = FALSE)
 
 if (!require('tidyverse')) install.packages('tidyverse'); library('tidyverse') # for everything
-if (!require('purrr')) install.packages('purrr'); library('purrr') # for progress bar
 if (!require('progress')) install.packages('progress'); library('progress') # for progress bar
 
 set.seed(321)
